@@ -7,7 +7,7 @@ module SpiderWeb
     ) where
 
 import ClassyPrelude.Conduit
-import Network.HTTP.Client (parseUrlThrow, getUri)
+import Network.HTTP.Client (parseUrlThrow, getUri, HttpException (..), HttpExceptionContent (..))
 import Network.HTTP.Simple
 import System.IO.Temp (withSystemTempDirectory)
 import System.IO (openBinaryTempFile)
@@ -113,11 +113,11 @@ download DownloadOpts {..} = liftIO $ withSystemTempDirectory "spiderweb" $ \tmp
         let uri = getUri req
         case stripPrefix doRoot urlText of
             Nothing
-                | doCheckOutsideRoot -> httpLBS (setRequestMethod "HEAD" req) >>= checkResponse
+                | doCheckOutsideRoot -> retryHTTP $ httpLBS (setRequestMethod "HEAD" req) >>= checkResponse
                 | otherwise -> return ()
             Just suffix -> do
                 (fp, h) <- liftIO $ openBinaryTempFile dsTempDir "download"
-                res <- httpSink req $ \res -> do
+                res <- retryHTTP $ httpSink req $ \res -> do
                     checkResponse res
                     let contentType = maybe "" (takeWhile (/= _semicolon))
                                     $ lookup "Content-Type"
@@ -148,7 +148,7 @@ download DownloadOpts {..} = liftIO $ withSystemTempDirectory "spiderweb" $ \tmp
             onToken (Tag.TagOpen "script" attrs _) = forM_ (lookup "src" attrs) addRoute'
             onToken _ = return ()
 
-            addRoute' = addRoute uri . unpack . decodeUtf8
+            addRoute' = addRoute uri . unpack . takeWhile (/= '#') . decodeUtf8
         checkContent _ "text/css" = return () -- FIXME! Need to implement something here
         checkContent _ _ = return ()
 
@@ -164,3 +164,13 @@ download DownloadOpts {..} = liftIO $ withSystemTempDirectory "spiderweb" $ \tmp
                         unless (route' `member` visisted) $ do
                             writeTQueue dsQueue route'
                             writeTVar dsVisited $! insertSet route' visisted
+
+retryHTTP :: IO a -> IO a
+retryHTTP inner =
+    loop 2
+  where
+    loop 0 = inner
+    loop i = inner `catch` \e ->
+      case e of
+        HttpExceptionRequest _req (ConnectionFailure _) -> loop (i - 1)
+        _ -> throwIO e
