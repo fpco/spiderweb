@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings, NoImplicitPrelude, RecordWildCards #-}
+{-# LANGUAGE FlexibleContexts #-}
 module SpiderWeb
     ( -- * Download
       download
@@ -14,6 +15,8 @@ import Data.Word8 (_semicolon)
 import qualified Text.HTML.TagStream.Types as Tag
 import qualified Text.HTML.TagStream.ByteString as Tag
 import qualified Network.URI as URI
+import Control.Concurrent.Async.Lifted.Safe (Concurrently (..))
+import Data.Foldable (sequenceA_)
 
 defaultSpiderWeb :: FilePath
 defaultSpiderWeb = "spider.web"
@@ -62,7 +65,10 @@ download DownloadOpts {..} = liftIO $ withSystemTempDirectory "spiderweb" $ \tmp
         <*> pure tmpdir
         <*> newTQueueIO
         <*> newTQueueIO
-    runConcurrently $ replicateM_ doWorkers (Concurrently (worker dstate))
+    runConcurrently
+      $ sequenceA_
+        (replicate doWorkers (Concurrently (worker dstate))
+            :: [Concurrently IO ()])
 
     errs <- atomically $ drainTQueue $ dsErrors dstate
 
@@ -107,7 +113,7 @@ download DownloadOpts {..} = liftIO $ withSystemTempDirectory "spiderweb" $ \tmp
         let uri = getUri req
         case stripPrefix doRoot urlText of
             Nothing
-                | doCheckOutsideRoot -> httpNoBody (setRequestMethod "HEAD" req) >>= checkResponse
+                | doCheckOutsideRoot -> httpLBS (setRequestMethod "HEAD" req) >>= checkResponse
                 | otherwise -> return ()
             Just suffix -> do
                 (fp, h) <- liftIO $ openBinaryTempFile dsTempDir "download"

@@ -21,6 +21,7 @@ library
                      , classy-prelude-conduit
                      , http-client
                      , http-conduit
+                     , lifted-async
                      , network-uri
                      , tagstream-conduit
                      , temporary
