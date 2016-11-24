@@ -20,6 +20,7 @@ library
                      , conduit-extra
                      , classy-prelude-conduit
                      , http-client
+                     , http-client-tls
                      , http-conduit
                      , lifted-async
                      , network-uri

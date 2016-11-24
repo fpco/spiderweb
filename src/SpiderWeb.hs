@@ -9,10 +9,11 @@ module SpiderWeb
 
 import ClassyPrelude.Conduit
 #if MIN_VERSION_http_client(0, 5, 0)
-import Network.HTTP.Client (parseUrlThrow, getUri, HttpException (..), HttpExceptionContent (..))
-#else
-import Network.HTTP.Client (parseUrlThrow, getUri, HttpException (..))
+import Network.HTTP.Client (HttpExceptionContent (..))
 #endif
+import Network.HTTP.Client (parseUrlThrow, getUri, HttpException (..), withResponseHistory, hrFinalRequest, hrFinalResponse, responseOpenHistory, responseClose)
+import Network.HTTP.Client.TLS (getGlobalManager)
+import Network.HTTP.Client.Conduit (bodyReaderSource)
 import Network.HTTP.Simple
 import System.IO.Temp (withSystemTempDirectory)
 import System.IO (openBinaryTempFile)
@@ -42,7 +43,7 @@ instance IsString DownloadOpts where
 
 data DownloadState = DownloadState
     { dsVisited :: !(TVar (HashSet Text))
-    , dsQueue :: !(TQueue Text)
+    , dsQueue :: !(TQueue (Text, Maybe URI.URI))
     , dsActive :: !(TVar Int)
     , dsTempDir :: !FilePath
     , dsErrors :: !(TQueue Text)
@@ -62,7 +63,7 @@ drainTQueue q =
 download :: MonadIO m => DownloadOpts -> m FilePath
 download DownloadOpts {..} = liftIO $ withSystemTempDirectory "spiderweb" $ \tmpdir -> do
     queue <- newTQueueIO
-    atomically $ writeTQueue queue doRoot
+    atomically $ writeTQueue queue (doRoot, Nothing)
     dstate <- DownloadState
         <$> newTVarIO (singletonSet doRoot)
         <*> pure queue
@@ -97,17 +98,23 @@ download DownloadOpts {..} = liftIO $ withSystemTempDirectory "spiderweb" $ \tmp
                         active <- readTVar dsActive
                         guard $ active == 0
                         return $ return ()
-                    Just item -> do
+                    Just (item, msource) -> do
                         modifyTVar dsActive (+ 1)
                         return $ do
-                            restore (handleAny (onError ds item) (oneURL ds item)) `finally`
+                            restore (handleAny (onError ds item msource) (oneURL ds item)) `finally`
                                 atomically (modifyTVar dsActive (subtract 1))
                             worker ds
         loop
 
-    onError DownloadState {..} item err = atomically $ writeTQueue dsErrors $ concat
+    onError DownloadState {..} item msource err = atomically $ writeTQueue dsErrors $ concat
         [ "When processing URL "
         , tshow item
+        , case msource of
+            Nothing -> ""
+            Just source -> concat
+                [ ", referenced from "
+                , tshow source
+                ]
         , ", received exception: "
         , pack $ displayException err
         ]
@@ -122,15 +129,23 @@ download DownloadOpts {..} = liftIO $ withSystemTempDirectory "spiderweb" $ \tmp
                 | otherwise -> return ()
             Just suffix -> do
                 (fp, h) <- liftIO $ openBinaryTempFile dsTempDir "download"
-                res <- retryHTTP $ httpSink req $ \res -> do
+                man <- liftIO getGlobalManager
+                res <- retryHTTP $ bracket
+                  (responseOpenHistory req man)
+                  (responseClose . hrFinalResponse) $ \hr -> do
+                    let res = hrFinalResponse hr
                     checkResponse res
                     let contentType = maybe "" (takeWhile (/= _semicolon))
                                     $ lookup "Content-Type"
                                     $ getResponseHeaders res
-                    getZipSink $
+
+                    -- May have followed a redirect
+                    let newUrlText = tshow $ getUri $ hrFinalRequest hr
+                        isOtherDomain = isNothing $ stripPrefix doRoot newUrlText
+                    unless isOtherDomain $ runConduit $ bodyReaderSource (getResponseBody res) .| (getZipSink $
                         ZipSink (sinkHandle h) *>
-                        ZipSink (checkContent uri contentType)
-                    return res
+                        ZipSink (checkContent uri contentType))
+                    return $ fmap (const ()) res
                 liftIO $ hClose h
                 atomically $ writeTQueue dsCaptured (res, suffix, fp)
       where
@@ -159,16 +174,17 @@ download DownloadOpts {..} = liftIO $ withSystemTempDirectory "spiderweb" $ \tmp
 
         addRoute _ route | "mailto:" `isPrefixOf` route = return ()
         addRoute _ route | "tel:" `isPrefixOf` route = return ()
+        addRoute _ route | "irc:" `isPrefixOf` route = return ()
         addRoute uri route =
             case URI.parseURIReference route of
                 Nothing -> error $ "Invalid URI reference: " ++ show route
                 Just ref -> do
                     let route' = tshow $ URI.nonStrictRelativeTo ref uri
                     atomically $ do
-                        visisted <- readTVar dsVisited
-                        unless (route' `member` visisted) $ do
-                            writeTQueue dsQueue route'
-                            writeTVar dsVisited $! insertSet route' visisted
+                        visited <- readTVar dsVisited
+                        unless (route' `member` visited) $ do
+                            writeTQueue dsQueue (route', Just uri)
+                            writeTVar dsVisited $! insertSet route' visited
 
 retryHTTP :: IO a -> IO a
 retryHTTP inner =
