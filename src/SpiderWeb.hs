@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings, NoImplicitPrelude, RecordWildCards #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE CPP #-}
 module SpiderWeb
     ( -- * Download
       download
@@ -7,7 +8,11 @@ module SpiderWeb
     ) where
 
 import ClassyPrelude.Conduit
+#if MIN_VERSION_http_client(0, 5, 0)
 import Network.HTTP.Client (parseUrlThrow, getUri, HttpException (..), HttpExceptionContent (..))
+#else
+import Network.HTTP.Client (parseUrlThrow, getUri, HttpException (..))
+#endif
 import Network.HTTP.Simple
 import System.IO.Temp (withSystemTempDirectory)
 import System.IO (openBinaryTempFile)
@@ -172,5 +177,10 @@ retryHTTP inner =
     loop 0 = inner
     loop i = inner `catch` \e ->
       case e of
+#if MIN_VERSION_http_client(0, 5, 0)
         HttpExceptionRequest _req (ConnectionFailure _) -> loop (i - 1)
+#else
+        FailedConnectionException {} -> loop (i - 1)
+        FailedConnectionException2 {} -> loop (i - 1)
+#endif
         _ -> throwIO e
