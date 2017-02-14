@@ -5,6 +5,7 @@ module SpiderWeb
     ( -- * Download
       download
     , DownloadOpts
+    , addOtherRoot
     ) where
 
 import ClassyPrelude.Conduit
@@ -29,6 +30,7 @@ defaultSpiderWeb = "spider.web"
 
 data DownloadOpts = DownloadOpts
     { doRoot :: !Text
+    , doOtherRoots :: ![Text]
     , doCheckOutsideRoot :: !Bool
     , doOutputFile :: !FilePath
     , doWorkers :: !Int
@@ -36,10 +38,14 @@ data DownloadOpts = DownloadOpts
 instance IsString DownloadOpts where
     fromString root = DownloadOpts
         { doRoot = reverse $ dropWhile (== '/') $ reverse $ takeWhile (/= '?') $ pack root
+        , doOtherRoots = []
         , doCheckOutsideRoot = False -- True
         , doOutputFile = defaultSpiderWeb
         , doWorkers = 8
         }
+
+addOtherRoot :: Text -> DownloadOpts -> DownloadOpts
+addOtherRoot x opts = opts { doOtherRoots = x : doOtherRoots opts }
 
 data DownloadState = DownloadState
     { dsVisited :: !(TVar (HashSet Text))
@@ -119,15 +125,20 @@ download DownloadOpts {..} = liftIO $ withSystemTempDirectory "spiderweb" $ \tmp
         , pack $ displayException err
         ]
 
+    stripPrefixes [] _ = Nothing
+    stripPrefixes (x:xs) y = stripPrefix x y <|> stripPrefixes xs y
+
     oneURL DownloadState {..} urlText = do
-        req <- parseRequest $ unpack urlText
         hPut stdout $ encodeUtf8 $ concat ["Checking URL: ", urlText, "\n"]
-        let uri = getUri req
-        case stripPrefix doRoot urlText of
+        case stripPrefixes (doRoot : doOtherRoots) urlText of
             Nothing
-                | doCheckOutsideRoot -> retryHTTP $ httpLBS (setRequestMethod "HEAD" req) >>= checkResponse
+                | doCheckOutsideRoot -> do
+                    req <- parseRequest $ unpack urlText
+                    retryHTTP $ httpLBS (setRequestMethod "HEAD" req) >>= checkResponse
                 | otherwise -> return ()
             Just suffix -> do
+                req <- parseRequest $ unpack $ doRoot ++ suffix
+                let uri = getUri req
                 (fp, h) <- liftIO $ openBinaryTempFile dsTempDir "download"
                 man <- liftIO getGlobalManager
                 res <- retryHTTP $ bracket
@@ -188,7 +199,7 @@ download DownloadOpts {..} = liftIO $ withSystemTempDirectory "spiderweb" $ \tmp
 
 retryHTTP :: IO a -> IO a
 retryHTTP inner =
-    loop 2
+    loop (2 :: Int)
   where
     loop 0 = inner
     loop i = inner `catch` \e ->
