@@ -27,6 +27,7 @@ library
                      , tagstream-conduit
                      , temporary
                      , word8
+                     , mtl
   default-language:    Haskell2010
 
 executable spiderweb

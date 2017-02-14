@@ -24,6 +24,7 @@ import qualified Text.HTML.TagStream.ByteString as Tag
 import qualified Network.URI as URI
 import Control.Concurrent.Async.Lifted.Safe (Concurrently (..))
 import Data.Foldable (sequenceA_)
+import Control.Monad.State.Strict (modify)
 
 defaultSpiderWeb :: FilePath
 defaultSpiderWeb = "spider.web"
@@ -178,17 +179,22 @@ download DownloadOpts {..} = liftIO $ withSystemTempDirectory "spiderweb" $ \tmp
           where
             code = getResponseStatusCode res
         checkContent uri "text/html" =
-            Tag.tokenStream .| mapM_C onToken
+            Tag.tokenStream .| (execStateC (0 :: Int) (mapM_C onToken) >>= checkH1Count)
           where
             onToken (Tag.TagOpen "a" attrs _) = forM_ (lookup "href" attrs) addRoute'
             onToken (Tag.TagOpen "link" attrs _) = forM_ (lookup "href" attrs) addRoute'
             onToken (Tag.TagOpen "img" attrs _) = forM_ (lookup "src" attrs) addRoute'
             onToken (Tag.TagOpen "script" attrs _) = forM_ (lookup "src" attrs) addRoute'
+            onToken (Tag.TagOpen "h1" _ _) = modify (+ 1)
             onToken _ = return ()
 
             addRoute' = addRoute uri . unpack . takeWhile (/= '#') . decodeUtf8
         checkContent _ "text/css" = return () -- FIXME! Need to implement something here
         checkContent _ _ = return ()
+
+        checkH1Count 1 = return ()
+        checkH1Count 0 = error "No <h1> tags found"
+        checkH1Count _ = error "Multiple <h1> tags found"
 
         addRoute _ route | "mailto:" `isPrefixOf` route = return ()
         addRoute _ route | "tel:" `isPrefixOf` route = return ()
