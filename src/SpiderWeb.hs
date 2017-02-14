@@ -92,9 +92,8 @@ download DownloadOpts {..} = liftIO $ withSystemTempDirectory "spiderweb" $ \tmp
             -- FIXME write output file
             return doOutputFile
         else do
-            let say = hPutStrLn stderr
-            say "Errors occurred during download:"
-            mapM_ say errs
+            sayErr "Errors occurred during download:"
+            mapM_ sayErr errs
             error "Download failed"
   where
     worker ds@DownloadState {..} = mask $ \restore -> join $ atomically $ do
