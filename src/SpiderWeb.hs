@@ -5,7 +5,7 @@ module SpiderWeb
     ( -- * Download
       download
     , DownloadOpts
-    , addOtherRoot
+    , addBannedDomain
     ) where
 
 import ClassyPrelude.Conduit
@@ -30,7 +30,7 @@ defaultSpiderWeb = "spider.web"
 
 data DownloadOpts = DownloadOpts
     { doRoot :: !Text
-    , doOtherRoots :: ![Text]
+    , doBannedDomains :: ![Text]
     , doCheckOutsideRoot :: !Bool
     , doOutputFile :: !FilePath
     , doWorkers :: !Int
@@ -38,14 +38,14 @@ data DownloadOpts = DownloadOpts
 instance IsString DownloadOpts where
     fromString root = DownloadOpts
         { doRoot = reverse $ dropWhile (== '/') $ reverse $ takeWhile (/= '?') $ pack root
-        , doOtherRoots = []
+        , doBannedDomains = []
         , doCheckOutsideRoot = False -- True
         , doOutputFile = defaultSpiderWeb
         , doWorkers = 8
         }
 
-addOtherRoot :: Text -> DownloadOpts -> DownloadOpts
-addOtherRoot x opts = opts { doOtherRoots = x : doOtherRoots opts }
+addBannedDomain :: Text -> DownloadOpts -> DownloadOpts
+addBannedDomain x opts = opts { doBannedDomains = x : doBannedDomains opts }
 
 data DownloadState = DownloadState
     { dsVisited :: !(TVar (HashSet Text))
@@ -126,11 +126,18 @@ download DownloadOpts {..} = liftIO $ withSystemTempDirectory "spiderweb" $ \tmp
         ]
 
     stripPrefixes [] _ = Nothing
-    stripPrefixes (x:xs) y = stripPrefix x y <|> stripPrefixes xs y
+    stripPrefixes (x:xs) y = (stripPrefix x y $> x) <|> stripPrefixes xs y
 
+    bannedPrefixes = do
+      domain <- doBannedDomains
+      scheme <- ["http:", "https:", ""]
+      return $ concat [scheme, "//", domain]
+
+    oneURL _ urlText
+        | any (`isPrefixOf` urlText) bannedPrefixes = terror $ "Invalid domain name: " ++ urlText
     oneURL DownloadState {..} urlText = do
         hPut stdout $ encodeUtf8 $ concat ["Checking URL: ", urlText, "\n"]
-        case stripPrefixes (doRoot : doOtherRoots) urlText of
+        case stripPrefix doRoot urlText of
             Nothing
                 | doCheckOutsideRoot -> do
                     req <- parseRequest $ unpack urlText
