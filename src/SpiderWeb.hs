@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedStrings, NoImplicitPrelude, RecordWildCards #-}
 {-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 module SpiderWeb
     ( -- * Download
       download
@@ -8,23 +8,25 @@ module SpiderWeb
     , addBannedDomain
     ) where
 
-import ClassyPrelude.Conduit
-#if MIN_VERSION_http_client(0, 5, 0)
+import Conduit
+import RIO
 import Network.HTTP.Client (HttpExceptionContent (..))
-#endif
 import Network.HTTP.Client (parseUrlThrow, getUri, HttpException (..), withResponseHistory, hrFinalRequest, hrFinalResponse, responseOpenHistory, responseClose)
 import Network.HTTP.Client.TLS (getGlobalManager)
 import Network.HTTP.Client.Conduit (bodyReaderSource)
 import Network.HTTP.Simple
-import System.IO.Temp (withSystemTempDirectory)
 import System.IO (openBinaryTempFile)
 import Data.Word8 (_semicolon)
 import qualified Text.HTML.TagStream.Types as Tag
 import qualified Text.HTML.TagStream.ByteString as Tag
 import qualified Network.URI as URI
-import Control.Concurrent.Async.Lifted.Safe (Concurrently (..))
 import Data.Foldable (sequenceA_)
 import Control.Monad.State.Strict (modify)
+
+import qualified RIO.HashSet as HS
+import qualified RIO.Text as T
+import qualified RIO.ByteString as B
+import qualified RIO.List as List
 
 defaultSpiderWeb :: FilePath
 defaultSpiderWeb = "spider.web"
@@ -38,7 +40,7 @@ data DownloadOpts = DownloadOpts
     }
 instance IsString DownloadOpts where
     fromString root = DownloadOpts
-        { doRoot = reverse $ dropWhile (== '/') $ reverse $ takeWhile (/= '?') $ pack root
+        { doRoot = T.reverse $ T.dropWhile (== '/') $ T.reverse $ T.takeWhile (/= '?') $ T.pack root
         , doBannedDomains = []
         , doCheckOutsideRoot = False -- True
         , doOutputFile = defaultSpiderWeb
@@ -53,7 +55,7 @@ data DownloadState = DownloadState
     , dsQueue :: !(TQueue (Text, Maybe URI.URI))
     , dsActive :: !(TVar Int)
     , dsTempDir :: !FilePath
-    , dsErrors :: !(TQueue Text)
+    , dsErrors :: !(TQueue Utf8Builder)
     , dsCaptured :: !(TQueue (Response (), Text, FilePath))
     }
 
@@ -67,33 +69,30 @@ drainTQueue q =
             Nothing -> return $ front []
             Just x -> loop $ front . (x:)
 
-download :: MonadIO m => DownloadOpts -> m FilePath
-download DownloadOpts {..} = liftIO $ withSystemTempDirectory "spiderweb" $ \tmpdir -> do
+download :: forall env. HasLogFunc env => DownloadOpts -> RIO env FilePath
+download DownloadOpts {..} = withSystemTempDirectory "spiderweb" $ \tmpdir -> do
     queue <- newTQueueIO
     atomically $ writeTQueue queue (doRoot, Nothing)
     dstate <- DownloadState
-        <$> newTVarIO (singletonSet doRoot)
+        <$> newTVarIO (HS.singleton doRoot)
         <*> pure queue
         <*> newTVarIO 0
         <*> pure tmpdir
         <*> newTQueueIO
         <*> newTQueueIO
-    runConcurrently
-      $ sequenceA_
-        (replicate doWorkers (Concurrently (worker dstate))
-            :: [Concurrently IO ()])
+    replicateConcurrently_ doWorkers $ worker dstate
 
     errs <- atomically $ drainTQueue $ dsErrors dstate
 
     if null errs
         then do
             captured <- atomically $ drainTQueue $ dsCaptured dstate
-            mapM_ print captured
+            mapM_ (logInfo . displayShow) captured
             -- FIXME write output file
             return doOutputFile
         else do
-            sayErr "Errors occurred during download:"
-            mapM_ sayErr errs
+            logError "Errors occurred during download:"
+            mapM_ (logError . display) errs
             error "Download failed"
   where
     worker ds@DownloadState {..} = mask $ \restore -> join $ atomically $ do
@@ -112,54 +111,50 @@ download DownloadOpts {..} = liftIO $ withSystemTempDirectory "spiderweb" $ \tmp
                             worker ds
         loop
 
-    onError DownloadState {..} item msource err = atomically $ writeTQueue dsErrors $ concat
-        [ "When processing URL "
-        , tshow item
-        , case msource of
-            Nothing -> ""
-            Just source -> concat
-                [ ", referenced from "
-                , tshow source
-                ]
-        , ", received exception: "
-        , pack $ displayException err
-        ]
+    onError DownloadState {..} item msource err = atomically $ writeTQueue dsErrors $
+        "When processing URL " <>
+        displayShow item <>
+        (case msource of
+            Nothing -> mempty
+            Just source -> ", referenced from " <> displayShow source) <>
+        ", received exception: " <>
+        (fromString $ displayException err)
 
     stripPrefixes [] _ = Nothing
-    stripPrefixes (x:xs) y = (stripPrefix x y $> x) <|> stripPrefixes xs y
+    stripPrefixes (x:xs) y = (T.stripPrefix x y $> x) <|> stripPrefixes xs y
 
     bannedPrefixes = do
       domain <- doBannedDomains
       scheme <- ["http:", "https:", ""]
-      return $ concat [scheme, "//", domain]
+      return $ T.concat [scheme, "//", domain]
 
     oneURL _ urlText
-        | any (`isPrefixOf` urlText) bannedPrefixes = terror $ "Invalid domain name: " ++ urlText
+        | any (`T.isPrefixOf` urlText) bannedPrefixes = error $ "Invalid domain name: " <> T.unpack urlText
     oneURL DownloadState {..} urlText = do
-        hPut stdout $ encodeUtf8 $ concat ["Checking URL: ", urlText, "\n"]
-        case stripPrefix doRoot urlText of
+        logInfo $ "Checking URL: " <> display urlText
+        case T.stripPrefix doRoot urlText of
             Nothing
                 | doCheckOutsideRoot -> do
-                    req <- parseRequest $ unpack urlText
+                    req <- parseRequest $ T.unpack urlText
                     retryHTTP $ httpLBS (setRequestMethod "HEAD" req) >>= checkResponse
                 | otherwise -> return ()
             Just suffix -> do
-                req <- parseRequest $ unpack $ doRoot ++ suffix
+                req <- parseRequest $ T.unpack $ doRoot <> suffix
                 let uri = getUri req
                 (fp, h) <- liftIO $ openBinaryTempFile dsTempDir "download"
                 man <- liftIO getGlobalManager
                 res <- retryHTTP $ bracket
-                  (responseOpenHistory req man)
-                  (responseClose . hrFinalResponse) $ \hr -> do
+                  (liftIO $ responseOpenHistory req man)
+                  (liftIO . responseClose . hrFinalResponse) $ \hr -> liftIO $ do
                     let res = hrFinalResponse hr
                     checkResponse res
-                    let contentType = maybe "" (takeWhile (/= _semicolon))
+                    let contentType = maybe "" (B.takeWhile (/= _semicolon))
                                     $ lookup "Content-Type"
                                     $ getResponseHeaders res
 
                     -- May have followed a redirect
                     let newUrlText = tshow $ getUri $ hrFinalRequest hr
-                        isOtherDomain = isNothing $ stripPrefix doRoot newUrlText
+                        isOtherDomain = isNothing $ T.stripPrefix doRoot newUrlText
                     unless isOtherDomain $ runConduit $ bodyReaderSource (getResponseBody res) .| (getZipSink $
                         ZipSink (sinkHandle h) *>
                         ZipSink (checkContent uri contentType))
@@ -169,7 +164,7 @@ download DownloadOpts {..} = liftIO $ withSystemTempDirectory "spiderweb" $ \tmp
       where
         checkResponse res
             | 200 <= code && code < 300 = return ()
-            | otherwise = error $ unpack $ concat
+            | otherwise = error $ T.unpack $ T.concat
                 [ "Unexpected status code "
                 , tshow code
                 , " for URL "
@@ -187,7 +182,7 @@ download DownloadOpts {..} = liftIO $ withSystemTempDirectory "spiderweb" $ \tmp
             onToken (Tag.TagOpen "h1" _ _) = modify (+ 1)
             onToken _ = return ()
 
-            addRoute' = addRoute uri . unpack . takeWhile (/= '#') . decodeUtf8
+            addRoute' = addRoute uri . T.unpack . T.takeWhile (/= '#') . decodeUtf8With lenientDecode
         checkContent _ "text/css" = return () -- FIXME! Need to implement something here
         checkContent _ _ = return ()
 
@@ -195,9 +190,9 @@ download DownloadOpts {..} = liftIO $ withSystemTempDirectory "spiderweb" $ \tmp
         checkH1Count 0 = error "No <h1> tags found"
         checkH1Count _ = error "Multiple <h1> tags found"
 
-        addRoute _ route | "mailto:" `isPrefixOf` route = return ()
-        addRoute _ route | "tel:" `isPrefixOf` route = return ()
-        addRoute _ route | "irc:" `isPrefixOf` route = return ()
+        addRoute _ route | "mailto:" `List.isPrefixOf` route = return ()
+        addRoute _ route | "tel:" `List.isPrefixOf` route = return ()
+        addRoute _ route | "irc:" `List.isPrefixOf` route = return ()
         addRoute uri route =
             case URI.parseURIReference route of
                 Nothing -> error $ "Invalid URI reference: " ++ show route
@@ -205,21 +200,16 @@ download DownloadOpts {..} = liftIO $ withSystemTempDirectory "spiderweb" $ \tmp
                     let route' = tshow $ URI.nonStrictRelativeTo ref uri
                     atomically $ do
                         visited <- readTVar dsVisited
-                        unless (route' `member` visited) $ do
+                        unless (route' `HS.member` visited) $ do
                             writeTQueue dsQueue (route', Just uri)
-                            writeTVar dsVisited $! insertSet route' visited
+                            writeTVar dsVisited $! HS.insert route' visited
 
-retryHTTP :: IO a -> IO a
+retryHTTP :: RIO env a -> RIO env a
 retryHTTP inner =
     loop (2 :: Int)
   where
     loop 0 = inner
     loop i = inner `catch` \e ->
       case e of
-#if MIN_VERSION_http_client(0, 5, 0)
         HttpExceptionRequest _req (ConnectionFailure _) -> loop (i - 1)
-#else
-        FailedConnectionException {} -> loop (i - 1)
-        FailedConnectionException2 {} -> loop (i - 1)
-#endif
         _ -> throwIO e
